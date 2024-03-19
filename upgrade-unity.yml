@@ -1,0 +1,197 @@
+# Manually upgrade unity and update packages
+# Check if the Unity version already exists as a docker image: https://game.ci/docs/docker/versions
+name: Upgrade Unity version
+
+on:
+  workflow_dispatch:
+    inputs:
+      unityVersion:
+        description: 'Unity version'
+        required: true
+        type: string
+      createTags:
+        description: 'Create Tags'
+        required: false
+        type: boolean
+        default: true
+      tagsOnly:
+        description: 'Only create tags'
+        required: true
+        type: boolean
+        default: false
+      mergeMaster:
+        description: 'Merge master into branch'
+        required: true
+        type: boolean
+        default: true
+      customParameters:
+        description: 'Custom cli arguments'
+        required: false
+        type: string
+        default: '-accept-apiupdate'
+
+jobs:
+  upgrade-unity-version:
+    name: Upgrade Unity version and packages
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+    steps:
+      - name: Log input parameter
+        run: |
+          BRANCH_NAME=${GITHUB_REF#refs/heads/}
+
+          echo "Branch: $BRANCH_NAME"
+          echo "Unity version: $UNITY_VERSION"
+          echo "Create tags: $CREATE_TAGS"
+          echo "Only create tags: $TAGS_ONLY"
+          echo "Merge master into branch: $MERGE_MASTER"
+          echo "Custom cli arguments: $CUSTOM_PARAMETERS"
+          if [[ "$BRANCH_NAME" == *"urp"* ]]
+          then
+            echo "urp: true"
+          else
+            echo "urp: false"
+          fi
+        env:
+          UNITY_VERSION: ${{ inputs.unityVersion }}
+          CREATE_TAGS: ${{ inputs.createTags }}
+          TAGS_ONLY: ${{ inputs.tagsOnly }}
+          MERGE_MASTER: ${{ inputs.mergeMaster }}
+          CUSTOM_PARAMETERS: ${{ inputs.customParameters }}
+
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          lfs: true
+          # Makes sure, that pushing new tags will trigger workflows
+          token: ${{ secrets.PR_GITHUB_TOKEN }}
+
+      - name: Set git user
+        run: |
+          git status
+          git config --global user.email "$GIT_USER@users.noreply.github.com"
+          git config --global user.name "$GIT_USER"
+        env:
+          GIT_USER: ${{ github.actor }}
+
+      # Make sure the branch has the latest master changes in
+      - name: Merge master into current branch
+        if: ${{ inputs.mergeMaster }}
+        run: |
+          git fetch origin master
+          git merge FETCH_HEAD
+          git push
+          git log -1
+
+      # Unity 2020 cache is not compatible with older versions
+      - name: Unity Library Cache 2020 or higher
+        if: ${{ !startsWith(inputs.unityVersion, '201') }}
+        uses: actions/cache@v4
+        with:
+          path: Library
+          key: Library-202x-WebGL
+          restore-keys: Library-202x-
+
+      - name: Unity Library Cache 2019 or lower
+        if: ${{ startsWith(inputs.unityVersion, '201') }}
+        uses: actions/cache@v4
+        with:
+          path: Library
+          key: Library-201x-WebGL
+          restore-keys: Library-201x-
+
+      - name: Set last unity version
+        id: last_unity_version
+        run: |
+          LAST_UNITY_VERSION=$(sed -n 's/^\m_EditorVersion: //p'< ./ProjectSettings/ProjectVersion.txt)
+          echo "VERSION=$LAST_UNITY_VERSION" >> $GITHUB_OUTPUT
+
+      - name: Set upgrade name
+        id: upgrade_name
+        run: |
+          BRANCH_NAME=${GITHUB_REF#refs/heads/}
+          if [[ "$BRANCH_NAME" == *"urp"* ]]
+          then
+            echo "NAME=$UNITY_VERSION-urp" >> $GITHUB_OUTPUT
+          else
+            echo "NAME=$UNITY_VERSION" >> $GITHUB_OUTPUT
+          fi
+        env:
+          UNITY_VERSION: ${{ inputs.unityVersion }}
+
+      - name: Log variables
+        run: |
+          echo "last_unity_version -> ${{ steps.last_unity_version.outputs.VERSION }}"
+          echo "upgrade_name -> ${{ steps.upgrade_name.outputs.NAME }}"
+
+      - name: Build project
+        if: ${{ !inputs.tagsOnly }}
+        uses: game-ci/unity-builder@v4
+        env:
+          UNITY_LICENSE: ${{ secrets.UNITY_LICENSE }}
+          UNITY_EMAIL: ${{ secrets.UNITY_EMAIL }}
+          UNITY_PASSWORD: ${{ secrets.UNITY_PASSWORD }}
+        with:
+          buildMethod: UnityBuilderAction.UnityPackageScripts.UpgradeAllPackagesToVerifiedVersion
+          customParameters: ${{ inputs.customParameters }}
+          unityVersion: ${{ inputs.unityVersion }}
+          targetPlatform: WebGL
+          buildName: ${{ needs.variables.outputs.BUILD_NAME }}
+          allowDirtyBuild: true
+          manualExit: true
+
+      - name: Delete build folder with elevated rights
+        if: ${{ !inputs.tagsOnly }}
+        run: sudo rm -rf ./build
+
+      - name: Render template
+        if: ${{ !inputs.tagsOnly }}
+        id: template
+        uses: chuhlomin/render-template@v1.9
+        with:
+          template: .github/templates/upgrade-unity-pr-body.md
+          vars: |
+            unityversion: ${{ steps.upgrade_name.outputs.NAME }}
+
+      - name: Create Pull Request
+        if: ${{ !inputs.tagsOnly }}
+        uses: peter-evans/create-pull-request@v4
+        with:
+          token: ${{ secrets.PR_GITHUB_TOKEN }}
+          commit-message: "[Automated workflow] upgrade-unity from ${{steps.last_unity_version.outputs.VERSION}} to ${{ inputs.unityVersion }}"
+          branch: "ci/upgrade-unity/from-${{steps.last_unity_version.outputs.VERSION}}-to-${{ steps.upgrade_name.outputs.NAME }}"
+          delete-branch: true
+          title: "[Automated workflow] upgrade-unity from ${{steps.last_unity_version.outputs.VERSION}} to ${{ steps.upgrade_name.outputs.NAME }}"
+          body: ${{ steps.template.outputs.result }}
+
+      - name: Add tags
+        if: ${{ inputs.createTags || inputs.tagsOnly }}
+        run: |
+          # Extract the first four characters of UNITY_VERSION
+          UNITY_YEAR=${UNITY_VERSION:0:4}
+          BRANCH_NAME=${GITHUB_REF#refs/heads/}
+
+          TAG_PREFIX=$UNITY_VERSION
+          if [[ "$BRANCH_NAME" == *"urp"* ]]
+          then
+            TAG_PREFIX=$UNITY_VERSION-urp
+          fi
+
+          if [[ "$UNITY_YEAR" < "2023" ]]
+          then
+            git tag -a -f $TAG_PREFIX-minsize-webgl1 -m "[Automated workflow] Created by upgrade-unity"
+            git tag -a -f $TAG_PREFIX-webgl1 -m "[Automated workflow] Created by upgrade-unity"
+          else
+            git tag -a -f $TAG_PREFIX-minsize-webgl2 -m "[Automated workflow] Created by upgrade-unity"
+          fi
+          # Push tags in between - pushing more than 3 tags won't trigger tag workflows
+          git push origin -f --tags
+
+          git tag -a -f $TAG_PREFIX-webgl2 -m "[Automated workflow] Created by upgrade-unity"
+          git tag -a -f $TAG_PREFIX-webgl2-debug -m "[Automated workflow] Created by upgrade-unity"
+
+          git push origin -f --tags
+        env:
+          UNITY_VERSION: ${{ inputs.unityVersion }}
+
